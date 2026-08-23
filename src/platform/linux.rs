@@ -1,8 +1,8 @@
 use std::{
     ffi::CString,
-    io::{BufRead, BufReader, Write},
+    io::Write,
     net::{Ipv4Addr, SocketAddr},
-    os::fd::AsRawFd,
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
     process::{Command, Stdio},
 };
 
@@ -116,82 +116,104 @@ pub fn prepare_run_user(user: &str) -> Result<()> {
 
 pub fn start_supervisor(port: u16, user: &str) -> Result<()> {
     require_root().context("run must be started as root on Linux")?;
-    let executable = std::env::current_exe().context("cannot locate current executable")?;
-    let pid = std::process::id().to_string();
-    let port = port.to_string();
-    let mut child = Command::new(executable)
-        .args(["supervise", "--pid", &pid, "--port", &port, "--user", user])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .context("failed to start privileged lifecycle supervisor")?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("supervisor stdout unavailable")?;
-    let mut reader = BufReader::new(stdout);
-    loop {
-        let mut response = String::new();
-        let bytes = reader
-            .read_line(&mut response)
-            .context("cannot read lifecycle supervisor status")?;
-        if bytes == 0 {
-            let status = child.wait()?;
-            bail!("lifecycle supervisor failed to start (status {status})");
-        }
-        if response.trim() == "READY" {
-            break;
-        }
-        eprint!("supervisor: {response}");
+    let parent_pid = std::process::id();
+    let mut pipe = [0; 2];
+    if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("cannot create supervisor pipe");
     }
-    std::thread::Builder::new()
-        .name("nft-supervisor-output".to_owned())
-        .spawn(move || {
-            for line in reader.lines().map_while(Result::ok) {
-                eprintln!("supervisor: {line}");
+    let read_fd = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+    let write_fd = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+
+    let child_pid = unsafe { libc::fork() };
+    if child_pid < 0 {
+        return Err(std::io::Error::last_os_error()).context("cannot fork lifecycle supervisor");
+    }
+    if child_pid == 0 {
+        drop(read_fd);
+        let exit_code = match supervise(parent_pid, port, user, write_fd) {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("lifecycle supervisor failed: {error:#}");
+                1
             }
-            let _ = child.wait();
-        })
-        .context("cannot start lifecycle supervisor output monitor")?;
+        };
+        unsafe { libc::_exit(exit_code) };
+    }
+
+    drop(write_fd);
+    let mut status = [0_u8; 1];
+    let read_result = unsafe { libc::read(read_fd.as_raw_fd(), status.as_mut_ptr().cast(), 1) };
+    if read_result != 1 || status[0] != 1 {
+        let mut wait_status = 0;
+        unsafe { libc::waitpid(child_pid, &mut wait_status, 0) };
+        bail!("lifecycle supervisor failed to start");
+    }
     eprintln!("automatic nftables lifecycle supervisor started");
     Ok(())
 }
 
-pub fn supervise(pid: u32, port: u16, user: &str) -> Result<()> {
+fn supervise(pid: u32, port: u16, user: &str, ready: OwnedFd) -> Result<()> {
     require_root()?;
+    if unsafe { libc::setsid() } < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("cannot create lifecycle supervisor session");
+    }
+    ignore_cleanup_signals()?;
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as libc::c_int };
     if pidfd < 0 {
         return Err(std::io::Error::last_os_error())
             .context("cannot monitor relay process with pidfd_open");
     }
 
-    let result = supervise_with_pidfd(pidfd, port, user);
+    let result = supervise_with_pidfd(pidfd, port, user, ready);
     unsafe { libc::close(pidfd) };
     result
 }
 
-fn supervise_with_pidfd(pidfd: libc::c_int, port: u16, user: &str) -> Result<()> {
+fn ignore_cleanup_signals() -> Result<()> {
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+        if unsafe { libc::signal(signal, libc::SIG_IGN) } == libc::SIG_ERR {
+            return Err(std::io::Error::last_os_error())
+                .context("cannot isolate lifecycle supervisor signals");
+        }
+    }
+    Ok(())
+}
+
+fn supervise_with_pidfd(pidfd: libc::c_int, port: u16, user: &str, ready: OwnedFd) -> Result<()> {
     install_if_needed(port, user)?;
-    println!("READY");
-    std::io::stdout().flush()?;
+    let ready_byte = [1_u8];
+    if unsafe { libc::write(ready.as_raw_fd(), ready_byte.as_ptr().cast(), 1) } != 1 {
+        return Err(std::io::Error::last_os_error()).context("cannot notify relay about readiness");
+    }
+    // The readiness pipe is startup-only. Closing it ensures the supervisor
+    // has no long-lived communication dependency on the relay process.
+    drop(ready);
 
     let mut descriptor = libc::pollfd {
         fd: pidfd,
         events: libc::POLLIN,
         revents: 0,
     };
-    loop {
+    let monitor_result = loop {
         let result = unsafe { libc::poll(&mut descriptor, 1, -1) };
         if result > 0 {
-            break;
+            break Ok(());
         }
         if result < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-            return Err(std::io::Error::last_os_error()).context("cannot monitor relay process");
+            break Err(std::io::Error::last_os_error()).context("cannot monitor relay process");
+        }
+    };
+
+    let cleanup_result = remove_if_present().context("nftables cleanup failed");
+    match (monitor_result, cleanup_result) {
+        (_, Err(cleanup_error)) => Err(cleanup_error),
+        (Err(monitor_error), Ok(())) => Err(monitor_error),
+        (Ok(()), Ok(())) => {
+            eprintln!("nftables cleanup completed after relay exit");
+            Ok(())
         }
     }
-
-    remove_if_present().context("relay exited, but nftables cleanup failed")
 }
 
 fn table_exists() -> Result<bool> {

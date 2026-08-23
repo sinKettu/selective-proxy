@@ -4,8 +4,6 @@ mod traffic;
 use std::path::PathBuf;
 
 use anyhow::Result;
-#[cfg(target_os = "linux")]
-use anyhow::bail;
 use clap::{Parser, Subcommand};
 
 use traffic::TrafficConfig;
@@ -25,10 +23,6 @@ enum Action {
     Run(RunArgs),
     /// Remove the nftables table.
     Remove,
-    /// Internal privileged Linux lifecycle supervisor.
-    #[cfg(target_os = "linux")]
-    #[command(hide = true)]
-    Supervise(SuperviseArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -54,17 +48,6 @@ struct RunArgs {
     manual_setup: bool,
 }
 
-#[cfg(target_os = "linux")]
-#[derive(clap::Args, Debug)]
-struct SuperviseArgs {
-    #[arg(long)]
-    pid: u32,
-    #[arg(long)]
-    port: u16,
-    #[arg(long)]
-    user: String,
-}
-
 impl From<RunArgs> for TrafficConfig {
     fn from(args: RunArgs) -> Self {
         Self {
@@ -75,8 +58,7 @@ impl From<RunArgs> for TrafficConfig {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     match Cli::parse().action {
         Action::Install(common) => platform::install(common.port, &common.user),
         Action::Remove => platform::remove(),
@@ -85,14 +67,10 @@ async fn main() -> Result<()> {
                 platform::start_supervisor(args.common.port, &args.common.user)?;
             }
             platform::prepare_run_user(&args.common.user)?;
-            traffic::run(args.into()).await
-        }
-        #[cfg(target_os = "linux")]
-        Action::Supervise(args) => {
-            if unsafe { libc::geteuid() } != 0 {
-                bail!("the lifecycle supervisor must run as root");
-            }
-            platform::supervise(args.pid, args.port, &args.user)
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(traffic::run(args.into()))
         }
     }
 }
