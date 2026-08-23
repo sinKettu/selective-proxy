@@ -1,0 +1,3 @@
+# One domain or glob per line. A plain domain also matches all subdomains.
+example.com
+*.example.org
