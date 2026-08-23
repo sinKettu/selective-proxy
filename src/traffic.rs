@@ -24,7 +24,6 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct TrafficConfig {
     pub port: u16,
-    pub user: String,
     pub domains: PathBuf,
     pub proxy: String,
 }
@@ -344,8 +343,6 @@ async fn relay(
 }
 
 pub async fn run(config: TrafficConfig) -> Result<()> {
-    platform::verify_run_user(&config.user)?;
-
     let rules = Arc::new(RwLock::new(DomainRules::load(config.domains)?));
     let proxy = Arc::new(Proxy::parse(&config.proxy)?);
     let listener = TcpListener::bind((platform::listener_address(), config.port)).await?;

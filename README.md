@@ -43,19 +43,24 @@ it:
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin selective-proxy
 ```
 
-Start the listener as that account. The proxy can be an IP address or a
-hostname; resolve it before installing interception rules if the local resolver
-itself depends on intercepted HTTP(S):
+Start `run` as root and pass the required unprivileged account in `--user`.
+The root launcher starts a small privileged supervisor and then permanently
+drops the relay process UID, GID, and supplementary groups to that account.
+The supervisor installs the nftables table if needed, monitors the relay
+through a Linux pidfd, and removes the table after the relay exits, including
+termination by `kill -9`. The proxy can be an IP address or a hostname:
 
 ```bash
-sudo -u selective-proxy ./target/release/selective-proxy run \
+sudo ./target/release/selective-proxy run \
   --domains ./domains.txt \
   --proxy http://127.0.0.1:8080 \
   --user selective-proxy \
   --port 12345
 ```
 
-In another terminal, install the nftables rules:
+To retain the old manual nftables setup mode, pass `--manual-setup` to `run`,
+install rules in another terminal, and remove them manually afterward. The
+`run` command itself is still started as root so it can switch to `--user`:
 
 ```bash
 sudo ./target/release/selective-proxy install --user selective-proxy --port 12345
@@ -70,7 +75,7 @@ curl -v https://example.net/
 
 The listener prints `PROXY` or `DIRECT` for each recognized connection.
 
-Remove interception before stopping the listener:
+With `--manual-setup`, remove interception before stopping the listener:
 
 ```bash
 sudo ./target/release/selective-proxy remove

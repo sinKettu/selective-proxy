@@ -181,7 +181,11 @@ impl Runtime {
     }
 }
 
-pub fn verify_run_user(_user: &str) -> Result<()> {
+pub fn prepare_run_user(_user: &str) -> Result<()> {
+    Ok(())
+}
+
+pub fn start_supervisor(_port: u16, _user: &str) -> Result<()> {
     Ok(())
 }
 

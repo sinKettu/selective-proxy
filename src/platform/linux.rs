@@ -1,5 +1,6 @@
 use std::{
-    io::Write,
+    ffi::CString,
+    io::{BufRead, BufReader, Write},
     net::{Ipv4Addr, SocketAddr},
     os::fd::AsRawFd,
     process::{Command, Stdio},
@@ -61,8 +62,16 @@ impl Runtime {
 }
 
 pub(crate) fn user_uid(user: &str) -> Result<u32> {
+    user_id(user, "-u", "uid")
+}
+
+fn user_gid(user: &str) -> Result<u32> {
+    user_id(user, "-g", "gid")
+}
+
+fn user_id(user: &str, argument: &str, kind: &str) -> Result<u32> {
     let output = Command::new("id")
-        .args(["-u", user])
+        .args([argument, user])
         .output()
         .context("failed to execute id")?;
     if !output.status.success() {
@@ -71,7 +80,7 @@ pub(crate) fn user_uid(user: &str) -> Result<u32> {
     String::from_utf8(output.stdout)?
         .trim()
         .parse()
-        .context("invalid uid from id")
+        .with_context(|| format!("invalid {kind} from id"))
 }
 
 fn require_root() -> Result<()> {
@@ -81,16 +90,132 @@ fn require_root() -> Result<()> {
     Ok(())
 }
 
-pub fn verify_run_user(user: &str) -> Result<()> {
-    let expected_uid = user_uid(user)?;
-    let actual_uid = unsafe { libc::geteuid() };
-    if actual_uid == 0 {
-        bail!("refusing to run as root; run as --user {user}");
+pub fn prepare_run_user(user: &str) -> Result<()> {
+    require_root().context("run must be started as root on Linux")?;
+    let uid = user_uid(user)?;
+    let gid = user_gid(user)?;
+    if uid == 0 {
+        bail!("--user must name an unprivileged account");
     }
-    if actual_uid != expected_uid {
-        bail!("run as {user}; its traffic is excluded from redirection");
+    let user_name = CString::new(user).context("user name contains a NUL byte")?;
+    if unsafe { libc::initgroups(user_name.as_ptr(), gid) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("cannot initialize user groups");
     }
+    if unsafe { libc::setgid(gid) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("cannot drop group privileges");
+    }
+    if unsafe { libc::setuid(uid) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("cannot drop user privileges");
+    }
+    if unsafe { libc::geteuid() } != uid || unsafe { libc::getegid() } != gid {
+        bail!("failed to switch to user {user}");
+    }
+    eprintln!("relay privileges dropped to {user} (uid {uid}, gid {gid})");
     Ok(())
+}
+
+pub fn start_supervisor(port: u16, user: &str) -> Result<()> {
+    require_root().context("run must be started as root on Linux")?;
+    let executable = std::env::current_exe().context("cannot locate current executable")?;
+    let pid = std::process::id().to_string();
+    let port = port.to_string();
+    let mut child = Command::new(executable)
+        .args(["supervise", "--pid", &pid, "--port", &port, "--user", user])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("failed to start privileged lifecycle supervisor")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("supervisor stdout unavailable")?;
+    let mut reader = BufReader::new(stdout);
+    loop {
+        let mut response = String::new();
+        let bytes = reader
+            .read_line(&mut response)
+            .context("cannot read lifecycle supervisor status")?;
+        if bytes == 0 {
+            let status = child.wait()?;
+            bail!("lifecycle supervisor failed to start (status {status})");
+        }
+        if response.trim() == "READY" {
+            break;
+        }
+        eprint!("supervisor: {response}");
+    }
+    std::thread::Builder::new()
+        .name("nft-supervisor-output".to_owned())
+        .spawn(move || {
+            for line in reader.lines().map_while(Result::ok) {
+                eprintln!("supervisor: {line}");
+            }
+            let _ = child.wait();
+        })
+        .context("cannot start lifecycle supervisor output monitor")?;
+    eprintln!("automatic nftables lifecycle supervisor started");
+    Ok(())
+}
+
+pub fn supervise(pid: u32, port: u16, user: &str) -> Result<()> {
+    require_root()?;
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as libc::c_int };
+    if pidfd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("cannot monitor relay process with pidfd_open");
+    }
+
+    let result = supervise_with_pidfd(pidfd, port, user);
+    unsafe { libc::close(pidfd) };
+    result
+}
+
+fn supervise_with_pidfd(pidfd: libc::c_int, port: u16, user: &str) -> Result<()> {
+    install_if_needed(port, user)?;
+    println!("READY");
+    std::io::stdout().flush()?;
+
+    let mut descriptor = libc::pollfd {
+        fd: pidfd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let result = unsafe { libc::poll(&mut descriptor, 1, -1) };
+        if result > 0 {
+            break;
+        }
+        if result < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return Err(std::io::Error::last_os_error()).context("cannot monitor relay process");
+        }
+    }
+
+    remove_if_present().context("relay exited, but nftables cleanup failed")
+}
+
+fn table_exists() -> Result<bool> {
+    let status = Command::new("nft")
+        .args(["list", "table", "inet", NFT_TABLE])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("failed to query nftables table")?;
+    Ok(status.success())
+}
+
+fn install_if_needed(port: u16, user: &str) -> Result<()> {
+    if table_exists()? {
+        return Ok(());
+    }
+    install(port, user)
+}
+
+fn remove_if_present() -> Result<()> {
+    if !table_exists()? {
+        return Ok(());
+    }
+    remove()
 }
 
 pub fn install(port: u16, user: &str) -> Result<()> {
