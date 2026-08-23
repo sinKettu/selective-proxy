@@ -8,8 +8,41 @@ use clap::{Parser, Subcommand};
 
 use traffic::TrafficConfig;
 
+const BUILD_INFO: &str = concat!(
+    "version: ",
+    env!("SELECTIVE_PROXY_BUILD_VERSION"),
+    "\nbuilt: ",
+    env!("SELECTIVE_PROXY_BUILD_TIME"),
+    "\ngit: ",
+    env!("SELECTIVE_PROXY_GIT_HASH"),
+    "\ncommit: ",
+    env!("SELECTIVE_PROXY_GIT_MESSAGE"),
+    "\nprofile: ",
+    env!("SELECTIVE_PROXY_BUILD_PROFILE"),
+    "\ntarget: ",
+    env!("SELECTIVE_PROXY_BUILD_TARGET"),
+);
+
 #[derive(Parser, Debug)]
-#[command(version, about)]
+#[command(
+    version = env!("CARGO_PKG_VERSION"),
+    long_version = BUILD_INFO,
+    about,
+    after_help = concat!(
+        "Build information:\nversion: ",
+        env!("SELECTIVE_PROXY_BUILD_VERSION"),
+        "\nbuilt: ",
+        env!("SELECTIVE_PROXY_BUILD_TIME"),
+        "\ngit: ",
+        env!("SELECTIVE_PROXY_GIT_HASH"),
+        "\ncommit: ",
+        env!("SELECTIVE_PROXY_GIT_MESSAGE"),
+        "\nprofile: ",
+        env!("SELECTIVE_PROXY_BUILD_PROFILE"),
+        "\ntarget: ",
+        env!("SELECTIVE_PROXY_BUILD_TARGET"),
+    )
+)]
 struct Cli {
     #[command(subcommand)]
     action: Action,

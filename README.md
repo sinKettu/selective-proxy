@@ -33,6 +33,15 @@ Build the optimized binary:
 cargo build --release
 ```
 
+Each compiled binary embeds the package version from `Cargo.toml`, UTC build
+date and time, Git commit hash, latest commit message, profile, and target.
+Display the full information through either command:
+
+```bash
+./target/release/selective-proxy --version
+./target/release/selective-proxy --help
+```
+
 The resulting executable is `./target/release/selective-proxy`.
 
 Create a dedicated unprivileged account. Its traffic is excluded from the
