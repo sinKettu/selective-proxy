@@ -1,8 +1,7 @@
 use std::{
     collections::HashSet,
-    fs, io,
-    net::{Ipv4Addr, SocketAddr},
-    os::fd::AsRawFd,
+    fs,
+    net::SocketAddr,
     path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime},
@@ -18,9 +17,8 @@ use tokio::{
 };
 use url::Url;
 
-use crate::system::user_uid;
+use crate::platform;
 
-const SO_ORIGINAL_DST: libc::c_int = 80;
 const PEEK_LIMIT: usize = 64 * 1024;
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -160,33 +158,6 @@ fn wildcard_match(pattern: &[u8], value: &[u8]) -> bool {
     p == pattern.len()
 }
 
-fn original_destination(stream: &TcpStream) -> io::Result<(Ipv4Addr, u16)> {
-    let mut address: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-    let mut length = size_of::<libc::sockaddr_in>() as libc::socklen_t;
-    let result = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_IP,
-            SO_ORIGINAL_DST,
-            (&mut address as *mut libc::sockaddr_in).cast(),
-            &mut length,
-        )
-    };
-    if result != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if address.sin_family != libc::AF_INET as libc::sa_family_t {
-        return Err(io::Error::other(format!(
-            "unsupported original address family: {}",
-            address.sin_family
-        )));
-    }
-    Ok((
-        Ipv4Addr::from(address.sin_addr.s_addr.to_ne_bytes()),
-        u16::from_be(address.sin_port),
-    ))
-}
-
 fn http_host(data: &[u8]) -> Option<String> {
     let headers_end = data.windows(4).position(|part| part == b"\r\n\r\n")?;
     let headers = &data[..headers_end + 2];
@@ -289,8 +260,13 @@ async fn read_initial(stream: &mut TcpStream, port: u16) -> Result<(Vec<u8>, Opt
     .context("timed out waiting for HTTP Host/TLS SNI")?
 }
 
-async fn connect_via_proxy(proxy: &Proxy, host: &str, port: u16) -> Result<TcpStream> {
-    let mut stream = timeout(READ_TIMEOUT, TcpStream::connect((&*proxy.host, proxy.port)))
+async fn connect_via_proxy(
+    runtime: &platform::Runtime,
+    proxy: &Proxy,
+    host: &str,
+    port: u16,
+) -> Result<(TcpStream, platform::ConnectionGuard)> {
+    let (mut stream, guard) = timeout(READ_TIMEOUT, runtime.connect(&proxy.host, proxy.port))
         .await
         .context("proxy connect timed out")??;
     let authority = format!("{host}:{port}");
@@ -331,7 +307,7 @@ async fn connect_via_proxy(proxy: &Proxy, host: &str, port: u16) -> Result<TcpSt
     {
         bail!("proxy CONNECT failed: {status_text}");
     }
-    Ok(stream)
+    Ok((stream, guard))
 }
 
 async fn relay(
@@ -339,19 +315,21 @@ async fn relay(
     peer: SocketAddr,
     rules: Arc<RwLock<DomainRules>>,
     proxy: Arc<Proxy>,
+    runtime: Arc<platform::Runtime>,
 ) -> Result<()> {
-    let (destination, port) = original_destination(&client)?;
+    let (destination, port) = runtime.original_destination(&client, peer)?;
     let (initial, host) = read_initial(&mut client, port).await?;
     let use_proxy = rules.write().await.matches(host.as_deref());
-    let mut upstream = if use_proxy {
+    let (mut upstream, _connection_guard) = if use_proxy {
         connect_via_proxy(
+            &runtime,
             &proxy,
             host.as_deref().unwrap_or(&destination.to_string()),
             port,
         )
         .await?
     } else {
-        TcpStream::connect((destination, port)).await?
+        runtime.connect(&destination.to_string(), port).await?
     };
     eprintln!(
         "{:<6} {} -> {}:{}",
@@ -366,30 +344,23 @@ async fn relay(
 }
 
 pub async fn run(config: TrafficConfig) -> Result<()> {
-    let expected_uid = user_uid(&config.user)?;
-    let actual_uid = unsafe { libc::geteuid() };
-    if actual_uid == 0 {
-        bail!("refusing to run as root; run as --user {}", config.user);
-    }
-    if actual_uid != expected_uid {
-        bail!(
-            "run as {}; its traffic is excluded from redirection",
-            config.user
-        );
-    }
+    platform::verify_run_user(&config.user)?;
 
     let rules = Arc::new(RwLock::new(DomainRules::load(config.domains)?));
     let proxy = Arc::new(Proxy::parse(&config.proxy)?);
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, config.port)).await?;
+    let listener = TcpListener::bind((platform::listener_address(), config.port)).await?;
+    let runtime = Arc::new(platform::Runtime::start(config.port)?);
     eprintln!(
-        "listening on 127.0.0.1:{}; press Ctrl-C to stop",
-        config.port
+        "listening on {}:{}; press Ctrl-C to stop",
+        platform::listener_address(),
+        config.port,
     );
     loop {
         let (stream, peer) = listener.accept().await?;
-        let (rules, proxy) = (Arc::clone(&rules), Arc::clone(&proxy));
+        let (rules, proxy, runtime) =
+            (Arc::clone(&rules), Arc::clone(&proxy), Arc::clone(&runtime));
         tokio::spawn(async move {
-            if let Err(error) = relay(stream, peer, rules, proxy).await {
+            if let Err(error) = relay(stream, peer, rules, proxy, runtime).await {
                 eprintln!("ERROR  {peer}: {error:#}");
             }
         });

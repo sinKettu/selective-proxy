@@ -1,15 +1,17 @@
-# Selective HTTP/HTTPS proxy PoC for Linux (Rust)
+# Selective HTTP/HTTPS proxy PoC for Linux and Windows (Rust)
 
-[`src/main.rs`](src/main.rs) demonstrates system-wide selective
-proxying with an nftables `OUTPUT` redirect, inspection of the HTTP `Host`
-header or TLS ClientHello SNI, and an HTTP `CONNECT` upstream proxy.
+The project demonstrates system-wide selective proxying, inspection of the
+HTTP `Host` header or TLS ClientHello SNI, and an HTTP `CONNECT` upstream
+proxy. Linux uses an nftables `OUTPUT` redirect. Windows uses WinDivert and an
+in-memory client-port-to-original-destination table.
 
 The previous Python implementation remains in [`selective_proxy.py`](selective_proxy.py)
 as a readable reference. The Rust binary is the primary implementation.
 
 ## Requirements and limitations
 
-- Linux, Rust/Cargo for building, a C linker (`build-essential` on Ubuntu), and nftables.
+- Linux requires nftables. Windows requires WinDivert 2.x and administrator
+  privileges.
 - IPv4 TCP traffic on destination ports 80 and 443 only.
 - TLS routing uses visible SNI. Encrypted Client Hello (ECH) cannot be routed by
   domain and therefore goes direct.
@@ -22,6 +24,8 @@ as a readable reference. The Rust binary is the primary implementation.
   Use a network namespace or a mature transparent proxy for production.
 
 ## Setup
+
+### Linux
 
 Build the optimized binary:
 
@@ -91,3 +95,22 @@ Traffic owned by the dedicated service UID bypasses interception. Do not run
 untrusted applications under that account. Localhost and `0.0.0.0/8` are also
 excluded. Other private or link-local destinations are intercepted unless
 their domain does not match, in which case the PoC reconnects directly.
+
+### Windows
+
+Download WinDivert 2.x and place the matching `WinDivert.dll` and driver file
+(`WinDivert64.sys` for a 64-bit build) next to `selective-proxy.exe`. Build and
+run from an elevated terminal:
+
+```powershell
+cargo build --release
+.\target\release\selective-proxy.exe run `
+  --domains .\domains.txt `
+  --proxy http://127.0.0.1:8080 `
+  --port 12345
+```
+
+The Windows filter exists only while the process is running; `install` and
+`remove` are informational compatibility commands. The relay reserves each of
+its outbound source ports in a bypass table to prevent recursive interception.
+The current Windows implementation handles IPv4 TCP ports 80 and 443 only.

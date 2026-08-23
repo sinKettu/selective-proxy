@@ -1,4 +1,4 @@
-mod system;
+mod platform;
 mod traffic;
 
 use std::path::PathBuf;
@@ -59,8 +59,8 @@ impl From<RunArgs> for TrafficConfig {
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().action {
-        Action::Install(common) => system::install_nft(common.port, &common.user),
-        Action::Remove => system::remove_nft(),
+        Action::Install(common) => platform::install(common.port, &common.user),
+        Action::Remove => platform::remove(),
         Action::Run(args) => traffic::run(args.into()).await,
     }
 }
