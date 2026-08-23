@@ -110,6 +110,35 @@ untrusted applications under that account. Localhost and `0.0.0.0/8` are also
 excluded. Other private or link-local destinations are intercepted unless
 their domain does not match, in which case the PoC reconnects directly.
 
+## Service installation
+
+Linux with systemd (build the release binary first):
+
+```bash
+sudo ./scripts/install-linux-service.sh \
+  selective-proxy \
+  http://127.0.0.1:8080 \
+  ./domains.txt
+```
+
+The generated unit starts at boot and uses `Restart=on-failure`. Follow logs
+with `journalctl -u selective-proxy -f`.
+
+Windows services require a service wrapper for ordinary console applications.
+Download the 64-bit NSSM executable from https://nssm.cc/, place `nssm.exe` in
+the project directory, and run elevated PowerShell:
+
+```powershell
+.\scripts\install-windows-service.ps1 `
+  -ProxyUrl http://127.0.0.1:8080 `
+  -DomainsFile .\domains.txt `
+  -Nssm .\nssm.exe
+```
+
+NSSM registers with Windows SCM, launches the console application, and restarts
+it after failures. The service uses delayed automatic startup. `WinDivert.dll`
+and `WinDivert64.sys` must be next to the executable.
+
 ### Windows
 
 Download WinDivert 2.x and place the matching `WinDivert.dll` and driver file
